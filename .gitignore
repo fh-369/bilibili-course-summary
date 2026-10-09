@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+notes/
+output/
+_temp/
+*.mp4
+*.mp3
+frames/
