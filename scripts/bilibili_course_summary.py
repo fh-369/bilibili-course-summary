@@ -293,6 +293,44 @@ def process_url(url, output_dir, audio_only=False, frame_threshold=500.0):
     return vdir
 
 
+def generate_master_summary(output_dir):
+    """扫描所有分P文件夹，按页码排序，汇总生成总文档。"""
+    import re as _re
+    entries = []
+    for name in os.listdir(output_dir):
+        full = os.path.join(output_dir, name)
+        if not os.path.isdir(full):
+            continue
+        m = _re.match(r"P(\d+)_", name)
+        if not m:
+            continue
+        summary_path = os.path.join(full, "summary.md")
+        if os.path.exists(summary_path):
+            entries.append((int(m.group(1)), name, summary_path))
+    if not entries:
+        return
+    entries.sort(key=lambda x: x[0])
+
+    parts = ["# 课程笔记汇总\n"]
+    parts.append(f"共 {len(entries)} 个分P，按顺序排列：\n")
+    parts.append("## 目录\n")
+    for pnum, name, _ in entries:
+        title = name.split("_", 1)[1] if "_" in name else name
+        parts.append(f"- [P{pnum}: {title}](#p{pnum})\n")
+    parts.append("\n---\n")
+
+    for pnum, name, spath in entries:
+        with open(spath, "r", encoding="utf-8") as f:
+            content = f.read()
+        parts.append(f'<a id="p{pnum}"></a>\n\n{content}\n\n---\n')
+
+    master_path = os.path.join(output_dir, "ALL_SUMMARIES.md")
+    with open(master_path, "w", encoding="utf-8") as f:
+        f.write("".join(parts))
+    print(f"\n📚 汇总文档已生成: {master_path}")
+    return master_path
+
+
 def main():
     ap = argparse.ArgumentParser(description="B站课程视频智能总结")
     ap.add_argument("urls", nargs="*", help="B站视频链接")
@@ -327,6 +365,10 @@ def main():
                 print(f"  ❌ 失败 [{u}]: {e}")
     else:
         ap.print_help()
+
+    # 所有视频处理完后，生成汇总文档
+    if urls or args.series:
+        generate_master_summary(args.output_dir)
 
 
 if __name__ == "__main__":
