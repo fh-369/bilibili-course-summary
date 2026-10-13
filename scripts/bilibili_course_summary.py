@@ -11,7 +11,14 @@ import subprocess
 import sys
 import time
 from urllib.parse import urlencode, urlparse
-from urllib.request import Request, urlopen
+
+# 使用 curl_cffi 模拟 Chrome，绕过 B 站 412 反爬
+try:
+    from curl_cffi import requests as cffi_req
+    HAS_CFFI = True
+except ImportError:
+    HAS_CFFI = False
+    from urllib.request import Request, urlopen
 
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -24,12 +31,28 @@ def _headers(referer="https://www.bilibili.com/"):
 
 
 def _fetch_json(url, referer="https://www.bilibili.com/"):
-    req = Request(url, headers=_headers(referer))
-    with urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    if data.get("code") != 0:
-        raise RuntimeError(f"B站API错误: {data.get('message')}")
-    return data.get("data", {})
+    """带重试的 B 站 API 请求。优先用 curl_cffi（绕过412），回退 urllib。"""
+    last_err = None
+    for attempt in range(4):
+        try:
+            if HAS_CFFI:
+                r = cffi_req.get(url, headers=_headers(referer),
+                                 impersonate="chrome120", timeout=30)
+                if r.status_code == 200 and r.text:
+                    data = r.json()
+                else:
+                    raise RuntimeError(f"HTTP {r.status_code}")
+            else:
+                req = Request(url, headers=_headers(referer))
+                with urlopen(req, timeout=30) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+            if data.get("code") != 0:
+                raise RuntimeError(f"B站API错误: {data.get('message')}")
+            return data.get("data", {})
+        except Exception as e:
+            last_err = e
+            time.sleep(2)
+    raise RuntimeError(f"请求失败: {url} ({last_err})")
 
 
 def parse_url(url):
@@ -53,8 +76,12 @@ def get_pagelist(bvid):
 
 
 def get_metadata(bvid):
-    url = "https://api.bilibili.com/x/web-interface/view?" + urlencode({"bvid": bvid})
-    return _fetch_json(url)
+    """x/web-interface/view 接口容易被412拦截，失败时返回最小dict即可。"""
+    try:
+        url = "https://api.bilibili.com/x/web-interface/view?" + urlencode({"bvid": bvid})
+        return _fetch_json(url)
+    except Exception:
+        return {"title": f"Bilibili课程 {bvid}", "bvid": bvid}
 
 
 def get_playurl(bvid, cid, quality=32):
@@ -89,17 +116,43 @@ def resolve_target(url):
 # ========== 下载与音频 ==========
 
 def download_video(play_url, output_path):
+    """下载视频，强制 HTTP/1.1（CDN 会重置 HTTP/2 流），并按 Content-Length 校验完整性。"""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    req = Request(play_url, headers=_headers())
-    with urlopen(req, timeout=60) as resp, open(output_path, "wb") as f:
-        while True:
-            chunk = resp.read(1024 * 1024)
-            if not chunk:
-                break
-            f.write(chunk)
-    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-        raise FileNotFoundError(f"下载失败: {output_path}")
-    return os.path.abspath(output_path)
+    last_err = None
+    for attempt in range(5):
+        try:
+            if HAS_CFFI:
+                r = cffi_req.get(play_url, headers=_headers(),
+                                 impersonate="chrome120", timeout=180,
+                                 stream=True, http_version=1)
+                expected = int(r.headers.get("Content-Length", 0))
+                total = 0
+                with open(output_path, "wb") as f:
+                    for chunk in r.iter_content(512 * 1024):
+                        f.write(chunk)
+                        total += len(chunk)
+            else:
+                req = Request(play_url, headers=_headers())
+                with urlopen(req, timeout=180) as resp, open(output_path, "wb") as f:
+                    while True:
+                        chunk = resp.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                total = os.path.getsize(output_path)
+                expected = 0
+            actual = os.path.getsize(output_path)
+            print(f"  [download] attempt {attempt+1}: {actual} bytes (expected {expected})", flush=True)
+            if expected and abs(actual - expected) < 1024:
+                return os.path.abspath(output_path)
+            if not expected and actual > 100000:
+                return os.path.abspath(output_path)
+            last_err = f"incomplete: {actual}/{expected}"
+        except Exception as e:
+            last_err = str(e)
+            print(f"  [download retry {attempt+1}] {e}", flush=True)
+        time.sleep(3)
+    raise FileNotFoundError(f"下载失败: {last_err}")
 
 
 def convert_to_mp3(video_path, output_dir):
@@ -150,12 +203,17 @@ def upload_to_minutes(audio_path, poll_interval=30, max_retries=10):
     mu = _run_lark(["minutes", "+upload", "--file-token", file_token])
     minute_token = mu["data"]["minute_token"]
     minute_url = mu["data"]["minute_url"]
-    # 轮询获取逐字稿（lark-cli输出目录有白名单限制，必须用Temp目录）
-    import tempfile
-    notes_dir = os.path.join(tempfile.gettempdir(), "bilibili_minutes")
+    # lark-cli 有路径白名单：不允许 C:\WINDOWS\TEMP，必须用 ~/AppData/Local/Temp
+    notes_dir = os.path.join(os.path.expanduser("~"), "AppData", "Local", "Temp", "bilibili_minutes")
     os.makedirs(notes_dir, exist_ok=True)
     for _ in range(max_retries):
-        nr = _run_lark(["vc", "+notes", "--minute-tokens", minute_token, "--output-dir", notes_dir])
+        try:
+            nr = _run_lark(["vc", "+notes", "--minute-tokens", minute_token, "--output-dir", notes_dir])
+        except RuntimeError as e:
+            # temporary token expired 等瞬时错误，等待重试
+            print(f"  [minutes] poll error: {e}", flush=True)
+            time.sleep(poll_interval)
+            continue
         notes = nr.get("data", {}).get("notes", [])
         if notes:
             tf = notes[0].get("artifacts", {}).get("transcript_file")

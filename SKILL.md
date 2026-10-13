@@ -26,7 +26,10 @@ description: 输入B站课程视频链接，自动下载指定分P、转写逐�
 
 运行前确认：
 - Python 3.10+，已安装 `av`(PyAV)、`pillow`、`curl_cffi`
+  - 安装命令：`python -m pip install av pillow curl_cffi`
+  - **注意**：必须用 `python -m pip`，直接 `pip` 可能装到别的 Python
 - 已安装并授权 `lark-cli`（飞书命令行工具）
+  - 验证：`lark-cli minutes +search --format json`（返回参数错误而非未授权，即代表已登录）
 
 详细配置见 [references/setup.md](references/setup.md)。
 
@@ -89,9 +92,14 @@ python scripts/bilibili_course_summary.py --series "BV1Fzszz4Ek7" --p-range 9,20
 | "固定2分钟抽一帧就够了" | 固定间隔会漏掉中间PPT切换，必须用MSE变化检测 |
 | "直接上传视频给妙记就行" | 妙记只收音频，必须先转MP3再上传 |
 | "逐字稿已经够了，不需要识别画面" | PPT上的公式、图表、代码口播讲不清楚，必须抽帧识别 |
-| "lark-cli输出目录随便写哪都行" | lark-cli有路径白名单，必须输出到Temp目录再复制 |
+| "lark-cli输出目录随便写哪都行" | lark-cli有路径白名单，必须用 `~/AppData/Local/Temp`，不能用 `C:\WINDOWS\TEMP` |
 | "MP3文件存在就行，不管大小" | 空文件(0字节)会导致妙记上传失败，必须校验>100KB |
 | "转音频用av.CodecContext.create('mp3','w')就行" | 必须用av.codec.Codec('libmp3lame','w')并显式设置采样率/声道/格式 |
+| "urllib.request 就能请求 B 站 API" | `x/web-interface/view` 等接口会 412 反爬，必须用 `curl_cffi`  impersonate=chrome120 |
+| "视频流用 HTTP/2 更快" | bilivideo CDN 会 `HTTP/2 stream reset`，下载必须强制 `http_version=1` |
+| "下载完不校验大小" | CDN 经常截断，必须对比 `Content-Length`，不一致就重试 |
+| "summary.md 模板就是最终笔记" | 脚本生成的 summary.md 是空骨架，必须基于 transcript.txt 重写结构化内容 |
+| "妙记 token 过期就放弃" | lark-cli 偶发 `temporary token expired`，重试一次即可 |
 
 ## Red Flags
 
@@ -101,6 +109,11 @@ python scripts/bilibili_course_summary.py --series "BV1Fzszz4Ek7" --p-range 9,20
 - 妙记上传报JSON解析错误 → MP3文件无效或lark-cli未授权
 - 总结内容是课程宣传/导学而不是技术内容 → 下错了分P
 - 批量处理时后面的视频全部失败 → 第一个视频的错误没中断，后续用了空文件
+- `HTTP Error 412` / `Expecting value: line 1 column 1` → B站反爬，必须装 curl_cffi 且用 impersonate
+- `curl: (92) HTTP/2 stream reset` / `curl: (18) end of response` → CDN 截断，强制 HTTP/1.1 + 按 Content-Length 重试
+- `Invalid data found when processing input: avcodec_send_packet` → mp4 下载不完整，删了重下
+- `--output ... is outside the built-in allowlist` → lark-cli 拒绝了 C:\WINDOWS\TEMP，改用 ~/AppData/Local/Temp
+- `parse temporary token from Authorization failed: temporary token expired` → lark-cli 会话 token 过期，重跑即可
 
 ## Verification
 
